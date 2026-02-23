@@ -2,28 +2,31 @@
 /**
  * Neural Network Design: The Gradient Puzzle
  *
- * Goal:
- * - Baseline model: MSE-only (copies the input noise).
- * - Student model: same starting point, but loss adds "intent":
- *   smoothness + left->right direction so structure emerges.
+ * Level 1: Standard reconstruction trap (pixel-wise MSE) -> copy input
+ * Level 2: "Distribution" constraint (Sorted MSE idea) -> implemented as CDF-loss (soft histogram)
+ * Level 3: Shape the geometry (Smoothness + Direction)
  *
- * This file is written to be minimal and readable for students.
+ * Baseline: fixed model, MSE only.
+ * Student: selectable architecture + custom loss with sliders.
  */
 
 // ==========================================
 // 1) Global Config + State
 // ==========================================
 const CONFIG = {
-  inputShapeModel: [16, 16, 1], // for layer inputShape (no batch)
-  inputShapeData: [1, 16, 16, 1], // actual tensor shape (with batch)
+  inputShapeModel: [16, 16, 1], // model inputShape (no batch)
+  inputShapeData: [1, 16, 16, 1], // actual tensor (with batch)
   learningRate: 0.02,
   autoTrainSpeed: 50, // ms between steps
   renderEvery: 5,
 };
 
-// Student loss coefficients (tune these)
-const LAMBDA_SMOOTH = 0.25; // ↑ more smoothing
-const LAMBDA_DIR = 0.35; // ↑ more left-dark/right-bright push
+// Live loss coefficients (controlled by sliders)
+const LOSS_COEFF = {
+  dist: 1.0,   // Level 2 distribution/CDF
+  smooth: 0.25, // Level 3 smoothness
+  dir: 0.35,    // Level 3 direction
+};
 
 let state = {
   step: 0,
@@ -36,7 +39,7 @@ let state = {
 };
 
 // ==========================================
-// 2) Loss helpers (given to students)
+// 2) Loss helpers (core building blocks)
 // ==========================================
 
 // MSE -> scalar
@@ -47,7 +50,7 @@ function mse(yTrue, yPred) {
 // Smoothness (total-variation style): penalize neighbor differences
 function smoothness(yPred) {
   return tf.tidy(() => {
-    // yPred shape: [1, 16, 16, 1]
+    // yPred: [1,16,16,1]
     const dx = yPred
       .slice([0, 0, 0, 0], [-1, -1, 15, -1])
       .sub(yPred.slice([0, 0, 1, 0], [-1, -1, 15, -1]));
@@ -61,10 +64,39 @@ function smoothness(yPred) {
 // DirectionX: encourage brighter pixels on the right than on the left
 function directionX(yPred) {
   return tf.tidy(() => {
-    // mask from -1 (left) to +1 (right)
     const mask = tf.linspace(-1, 1, 16).reshape([1, 1, 16, 1]); // [1,1,16,1]
     // maximize mean(yPred * mask) => minimize negative
     return tf.mean(yPred.mul(mask)).mul(-1);
+  });
+}
+
+/**
+ * Level 2 approximation: "Sorted MSE" via differentiable CDF-loss
+ * - Hard sort is non-smooth / problematic for gradients in TF.js.
+ * - We approximate "match sorted values" by matching CDFs of a soft histogram.
+ * This behaves like a 1D Wasserstein/quantile-ish constraint for teaching.
+ */
+function softHistogram(xFlat, bins = 16, sigma = 0.04) {
+  return tf.tidy(() => {
+    // xFlat: [N] values in [0,1]
+    const centers = tf.linspace(0, 1, bins); // [B]
+    const x = xFlat.reshape([-1, 1]); // [N,1]
+    const c = centers.reshape([1, -1]); // [1,B]
+    const w = tf.exp(tf.neg(tf.square(x.sub(c)).div(2 * sigma * sigma))); // [N,B]
+    const hist = tf.mean(w, 0); // [B]
+    return hist.div(hist.sum().add(1e-8));
+  });
+}
+
+function cdfLoss(yTrue, yPred, bins = 16, sigma = 0.04) {
+  return tf.tidy(() => {
+    const a = yTrue.reshape([-1]); // [256]
+    const b = yPred.reshape([-1]); // [256]
+    const ha = softHistogram(a, bins, sigma);
+    const hb = softHistogram(b, bins, sigma);
+    const cdfa = tf.cumsum(ha);
+    const cdfb = tf.cumsum(hb);
+    return tf.mean(tf.square(cdfa.sub(cdfb)));
   });
 }
 
@@ -82,12 +114,12 @@ function createBaselineModel() {
   return model;
 }
 
-// ------------------------------------------------------------------
-// TODO-A (Architecture): student selectable projection type
-// - compression: implemented
-// - transformation: implemented (256 -> 256 -> 256)
-// - expansion: implemented (256 -> 512 -> 256)
-// ------------------------------------------------------------------
+/**
+ * Student selectable projection type:
+ * - compression: 256 -> 64 -> 256
+ * - transformation: 256 -> 256 -> 256
+ * - expansion: 256 -> 512 -> 256
+ */
 function createStudentModel(archType) {
   const model = tf.sequential();
   model.add(tf.layers.flatten({ inputShape: CONFIG.inputShapeModel }));
@@ -96,11 +128,9 @@ function createStudentModel(archType) {
     model.add(tf.layers.dense({ units: 64, activation: "relu" }));
     model.add(tf.layers.dense({ units: 256, activation: "sigmoid" }));
   } else if (archType === "transformation") {
-    // 1:1-ish projection: keep dimension
     model.add(tf.layers.dense({ units: 256, activation: "relu" }));
     model.add(tf.layers.dense({ units: 256, activation: "sigmoid" }));
   } else if (archType === "expansion") {
-    // overcomplete projection: expand then project back
     model.add(tf.layers.dense({ units: 512, activation: "relu" }));
     model.add(tf.layers.dense({ units: 256, activation: "sigmoid" }));
   } else {
@@ -112,27 +142,15 @@ function createStudentModel(archType) {
 }
 
 // ==========================================
-// 4) Student custom loss (the "intent")
+// 4) Student custom loss (Level 2 + Level 3)
 // ==========================================
 
-// ------------------------------------------------------------------
-// TODO-B (Custom loss): students usually edit coefficients/terms here
-// Baseline: MSE only
-// Student:  MSE + smoothness + directionX
-//
-// Note about "no new colors":
-// - Strict histogram preservation is hard with dense nets,
-//   so we approximate the "sliding puzzle" constraint by keeping MSE
-//   strong enough to anchor values near the input distribution.
-// ------------------------------------------------------------------
 function studentLoss(yTrue, yPred) {
   return tf.tidy(() => {
-    const lossMSE = mse(yTrue, yPred);
-    const lossSmooth = smoothness(yPred).mul(LAMBDA_SMOOTH);
-    const lossDir = directionX(yPred).mul(LAMBDA_DIR);
-
-    // Total
-    return lossMSE.add(lossSmooth).add(lossDir);
+    const Ldist = cdfLoss(yTrue, yPred).mul(LOSS_COEFF.dist);
+    const Lsmooth = smoothness(yPred).mul(LOSS_COEFF.smooth);
+    const Ldir = directionX(yPred).mul(LOSS_COEFF.dir);
+    return Ldist.add(Lsmooth).add(Ldir);
   });
 }
 
@@ -141,7 +159,6 @@ function studentLoss(yTrue, yPred) {
 // ==========================================
 
 function trainModelStep(model, optimizer, lossFn, x) {
-  // Use trainable variables (NOT getWeights())
   const varList = model.trainableWeights.map((w) => w.val);
 
   const { value, grads } = tf.variableGrads(() => {
@@ -177,9 +194,8 @@ async function trainStep() {
       ),
     );
 
-    // TODO-C (Comparison): show both losses + visual difference
     log(
-      `Step ${state.step}: Base Loss=${baseLoss.toFixed(4)} | Student Loss=${studLoss.toFixed(4)}`,
+      `Step ${state.step}: Base=${baseLoss.toFixed(4)} | Student=${studLoss.toFixed(4)} | λDist=${LOSS_COEFF.dist.toFixed(2)} λSmooth=${LOSS_COEFF.smooth.toFixed(2)} λDir=${LOSS_COEFF.dir.toFixed(2)}`,
     );
 
     if (state.step % CONFIG.renderEvery === 0 || !state.isAutoTraining) {
@@ -253,7 +269,6 @@ function loop() {
   setTimeout(loop, CONFIG.autoTrainSpeed);
 }
 
-// Reset + init
 function resetModels(archType = null) {
   if (state.isAutoTraining) stopAutoTrain();
 
@@ -262,7 +277,6 @@ function resetModels(archType = null) {
     archType = checked ? checked.value : "compression";
   }
 
-  // Dispose old
   if (state.baselineModel) state.baselineModel.dispose();
   if (state.studentModel) state.studentModel.dispose();
   if (state.optimizerBase) state.optimizerBase.dispose();
@@ -271,13 +285,28 @@ function resetModels(archType = null) {
   state.baselineModel = createBaselineModel();
   state.studentModel = createStudentModel(archType);
 
-  // Separate optimizers (clean separation, easier for students)
   state.optimizerBase = tf.train.adam(CONFIG.learningRate);
   state.optimizerStudent = tf.train.adam(CONFIG.learningRate);
 
   state.step = 0;
   log(`Models reset. Student Arch: ${archType}`);
   render();
+}
+
+function bindSlider(id, valId, key) {
+  const s = document.getElementById(id);
+  const v = document.getElementById(valId);
+  const set = () => {
+    LOSS_COEFF[key] = parseFloat(s.value);
+    v.innerText = LOSS_COEFF[key].toFixed(2);
+  };
+  s.addEventListener("input", () => {
+    set();
+    log(
+      `Loss coeffs: dist=${LOSS_COEFF.dist.toFixed(2)}, smooth=${LOSS_COEFF.smooth.toFixed(2)}, dir=${LOSS_COEFF.dir.toFixed(2)}`,
+    );
+  });
+  set();
 }
 
 function init() {
@@ -293,7 +322,7 @@ function init() {
   // init models
   resetModels("compression");
 
-  // bind UI
+  // bind UI buttons
   document.getElementById("btn-train").addEventListener("click", trainStep);
   document.getElementById("btn-auto").addEventListener("click", toggleAutoTrain);
   document.getElementById("btn-reset").addEventListener("click", () => {
@@ -302,6 +331,7 @@ function init() {
     resetModels(arch);
   });
 
+  // bind architecture radios
   document.querySelectorAll('input[name="arch"]').forEach((radio) => {
     radio.addEventListener("change", (e) => {
       const arch = e.target.value;
@@ -310,6 +340,11 @@ function init() {
       resetModels(arch);
     });
   });
+
+  // bind sliders
+  bindSlider("sld-dist", "val-dist", "dist");
+  bindSlider("sld-smooth", "val-smooth", "smooth");
+  bindSlider("sld-dir", "val-dir", "dir");
 
   log("Initialized. Ready to train.");
 }
