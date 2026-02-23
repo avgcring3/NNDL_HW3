@@ -184,6 +184,31 @@
           <span>Expansion</span>
         </label>
       </div>
+
+      <!-- Student loss sliders (Level 2 + Level 3) -->
+      <div class="control-group" style="border-right:none;">
+        <strong>Student Loss:</strong>
+
+        <div style="display:flex; flex-direction:column; gap:6px; min-width:260px;">
+          <label style="display:flex; align-items:center; gap:10px;">
+            <span style="width:90px;">λDist</span>
+            <input id="sld-dist" type="range" min="0" max="2" step="0.01" value="1.00" />
+            <span id="val-dist" style="width:55px; text-align:right; font-family:monospace;">1.00</span>
+          </label>
+
+          <label style="display:flex; align-items:center; gap:10px;">
+            <span style="width:90px;">λSmooth</span>
+            <input id="sld-smooth" type="range" min="0" max="2" step="0.01" value="0.25" />
+            <span id="val-smooth" style="width:55px; text-align:right; font-family:monospace;">0.25</span>
+          </label>
+
+          <label style="display:flex; align-items:center; gap:10px;">
+            <span style="width:90px;">λDir</span>
+            <input id="sld-dir" type="range" min="0" max="2" step="0.01" value="0.35" />
+            <span id="val-dir" style="width:55px; text-align:right; font-family:monospace;">0.35</span>
+          </label>
+        </div>
+      </div>
     </div>
 
     <div class="grid-container">
