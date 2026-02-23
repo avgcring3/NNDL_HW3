@@ -1,0 +1,219 @@
+<!-- index.html -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neural Network Design: The Gradient Puzzle</title>
+
+    <!-- TensorFlow.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+
+    <style>
+      :root {
+        --bg-color: #1e1e2e;
+        --card-bg: #2b2b3b;
+        --text-main: #e0e0e0;
+        --accent: #4a90e2;
+        --success: #50c878;
+        --warning: #ffcc00;
+        --danger: #ff5555;
+        --border-radius: 8px;
+      }
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background-color: var(--bg-color);
+        color: var(--text-main);
+        margin: 0;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      h1 {
+        margin-bottom: 20px;
+        text-align: center;
+        font-weight: 300;
+      }
+
+      .controls {
+        background-color: var(--card-bg);
+        padding: 15px 25px;
+        border-radius: var(--border-radius);
+        margin-bottom: 25px;
+        display: flex;
+        gap: 20px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: center;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+      }
+      .control-group {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        border-right: 1px solid #444;
+        padding-right: 20px;
+      }
+      .control-group:last-child {
+        border-right: none;
+        padding-right: 0;
+      }
+
+      button {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: bold;
+        transition: opacity 0.2s;
+      }
+      button:hover {
+        opacity: 0.9;
+      }
+      .btn-train {
+        background-color: var(--accent);
+        color: white;
+      }
+      .btn-auto {
+        background-color: var(--success);
+        color: white;
+      }
+      .btn-reset {
+        background-color: var(--danger);
+        color: white;
+      }
+      .btn-stop {
+        background-color: var(--warning);
+        color: #333;
+      }
+
+      label {
+        margin-right: 8px;
+        cursor: pointer;
+      }
+
+      .grid-container {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 30px;
+        width: 100%;
+        max-width: 1000px;
+      }
+      .card {
+        background-color: var(--card-bg);
+        padding: 20px;
+        border-radius: var(--border-radius);
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+      }
+      .card h3 {
+        margin-top: 0;
+        color: var(--accent);
+        font-size: 1.1em;
+      }
+      .card p {
+        font-size: 0.9em;
+        color: #aaa;
+        margin-bottom: 10px;
+      }
+
+      canvas {
+        border: 2px solid #555;
+        image-rendering: pixelated;
+        width: 256px;
+        height: 256px;
+        background-color: black;
+        margin-bottom: 10px;
+      }
+      .loss-display {
+        font-family: monospace;
+        font-size: 0.9em;
+        color: var(--success);
+      }
+
+      #log-area {
+        width: 100%;
+        max-width: 1000px;
+        margin-top: 20px;
+        padding: 15px;
+        background-color: #111;
+        color: #0f0;
+        font-family: monospace;
+        border-radius: 4px;
+        height: 110px;
+        overflow-y: auto;
+        border: 1px solid #333;
+      }
+      .error {
+        color: var(--danger);
+      }
+
+      .arch-selector input[type="radio"]:checked + span {
+        color: var(--accent);
+        font-weight: bold;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h1>Neural Network Design: The Gradient Puzzle</h1>
+
+    <div class="controls">
+      <div class="control-group">
+        <button id="btn-train" class="btn-train">Train 1 Step</button>
+        <button id="btn-auto" class="btn-auto">Auto Train (Start)</button>
+        <button id="btn-reset" class="btn-reset">Reset Weights</button>
+      </div>
+
+      <div class="control-group arch-selector">
+        <strong>Architecture:</strong>
+        <label>
+          <input type="radio" name="arch" value="compression" checked />
+          <span>Compression</span>
+        </label>
+        <label>
+          <input type="radio" name="arch" value="transformation" />
+          <span>Transformation</span>
+        </label>
+        <label>
+          <input type="radio" name="arch" value="expansion" />
+          <span>Expansion</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="grid-container">
+      <div class="card">
+        <h3>Input (Noise)</h3>
+        <p>Fixed Random Noise<br />[16x16]</p>
+        <canvas id="canvas-input" width="16" height="16"></canvas>
+        <div class="loss-display">-</div>
+      </div>
+
+      <div class="card">
+        <h3>Baseline Output</h3>
+        <p>Model: Fixed Compression<br />Loss: MSE Only</p>
+        <canvas id="canvas-baseline" width="16" height="16"></canvas>
+        <div id="loss-baseline" class="loss-display">Loss: 0.00000</div>
+      </div>
+
+      <div class="card" style="border: 2px solid var(--accent)">
+        <h3>Student Output</h3>
+        <p>
+          Model: <span id="student-arch-label">Compression</span><br />
+          Loss: <strong>Custom</strong>
+        </p>
+        <canvas id="canvas-student" width="16" height="16"></canvas>
+        <div id="loss-student" class="loss-display">Loss: 0.00000</div>
+      </div>
+    </div>
+
+    <div id="log-area">Ready. Edit app.js to customize logic...</div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
