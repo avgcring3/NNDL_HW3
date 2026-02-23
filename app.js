@@ -8,24 +8,25 @@
  *
  * Baseline: fixed model, MSE only.
  * Student: selectable architecture + custom loss with sliders.
+ *
+ * Fixes in this version:
+ * - Robust slider binding with null checks + input/change events
+ * - Clear console+log messages if slider elements are missing
+ * - renderEvery defaults to 1 for immediate visual feedback
  */
 
-// ==========================================
-// 1) Global Config + State
-// ==========================================
 const CONFIG = {
-  inputShapeModel: [16, 16, 1], // model inputShape (no batch)
-  inputShapeData: [1, 16, 16, 1], // actual tensor (with batch)
+  inputShapeModel: [16, 16, 1],
+  inputShapeData: [1, 16, 16, 1],
   learningRate: 0.02,
-  autoTrainSpeed: 50, // ms between steps
-  renderEvery: 5,
+  autoTrainSpeed: 50,
+  renderEvery: 1, // show updates every step (makes slider effects easier to see)
 };
 
-// Live loss coefficients (controlled by sliders)
 const LOSS_COEFF = {
-  dist: 1.0,   // Level 2 distribution/CDF
-  smooth: 0.25, // Level 3 smoothness
-  dir: 0.35,    // Level 3 direction
+  dist: 1.0,
+  smooth: 0.25,
+  dir: 0.35,
 };
 
 let state = {
@@ -38,19 +39,14 @@ let state = {
   optimizerStudent: null,
 };
 
-// ==========================================
-// 2) Loss helpers (core building blocks)
-// ==========================================
+// -------------------- Loss helpers --------------------
 
-// MSE -> scalar
 function mse(yTrue, yPred) {
   return tf.tidy(() => tf.mean(tf.square(yTrue.sub(yPred))));
 }
 
-// Smoothness (total-variation style): penalize neighbor differences
 function smoothness(yPred) {
   return tf.tidy(() => {
-    // yPred: [1,16,16,1]
     const dx = yPred
       .slice([0, 0, 0, 0], [-1, -1, 15, -1])
       .sub(yPred.slice([0, 0, 1, 0], [-1, -1, 15, -1]));
@@ -61,24 +57,16 @@ function smoothness(yPred) {
   });
 }
 
-// DirectionX: encourage brighter pixels on the right than on the left
 function directionX(yPred) {
   return tf.tidy(() => {
-    const mask = tf.linspace(-1, 1, 16).reshape([1, 1, 16, 1]); // [1,1,16,1]
-    // maximize mean(yPred * mask) => minimize negative
+    const mask = tf.linspace(-1, 1, 16).reshape([1, 1, 16, 1]);
     return tf.mean(yPred.mul(mask)).mul(-1);
   });
 }
 
-/**
- * Level 2 approximation: "Sorted MSE" via differentiable CDF-loss
- * - Hard sort is non-smooth / problematic for gradients in TF.js.
- * - We approximate "match sorted values" by matching CDFs of a soft histogram.
- * This behaves like a 1D Wasserstein/quantile-ish constraint for teaching.
- */
+// Soft histogram + CDF loss (differentiable approximation of "Sorted MSE")
 function softHistogram(xFlat, bins = 16, sigma = 0.04) {
   return tf.tidy(() => {
-    // xFlat: [N] values in [0,1]
     const centers = tf.linspace(0, 1, bins); // [B]
     const x = xFlat.reshape([-1, 1]); // [N,1]
     const c = centers.reshape([1, -1]); // [1,B]
@@ -90,8 +78,8 @@ function softHistogram(xFlat, bins = 16, sigma = 0.04) {
 
 function cdfLoss(yTrue, yPred, bins = 16, sigma = 0.04) {
   return tf.tidy(() => {
-    const a = yTrue.reshape([-1]); // [256]
-    const b = yPred.reshape([-1]); // [256]
+    const a = yTrue.reshape([-1]);
+    const b = yPred.reshape([-1]);
     const ha = softHistogram(a, bins, sigma);
     const hb = softHistogram(b, bins, sigma);
     const cdfa = tf.cumsum(ha);
@@ -100,12 +88,19 @@ function cdfLoss(yTrue, yPred, bins = 16, sigma = 0.04) {
   });
 }
 
-// ==========================================
-// 3) Model architectures
-// ==========================================
+// Student custom loss: Level2 + Level3
+function studentLoss(yTrue, yPred) {
+  return tf.tidy(() => {
+    const Ldist = cdfLoss(yTrue, yPred).mul(LOSS_COEFF.dist);
+    const Lsmooth = smoothness(yPred).mul(LOSS_COEFF.smooth);
+    const Ldir = directionX(yPred).mul(LOSS_COEFF.dir);
+    return Ldist.add(Lsmooth).add(Ldir);
+  });
+}
+
+// -------------------- Models --------------------
 
 function createBaselineModel() {
-  // Fixed Compression AE: 256 -> 64 -> 256
   const model = tf.sequential();
   model.add(tf.layers.flatten({ inputShape: CONFIG.inputShapeModel }));
   model.add(tf.layers.dense({ units: 64, activation: "relu" }));
@@ -114,12 +109,6 @@ function createBaselineModel() {
   return model;
 }
 
-/**
- * Student selectable projection type:
- * - compression: 256 -> 64 -> 256
- * - transformation: 256 -> 256 -> 256
- * - expansion: 256 -> 512 -> 256
- */
 function createStudentModel(archType) {
   const model = tf.sequential();
   model.add(tf.layers.flatten({ inputShape: CONFIG.inputShapeModel }));
@@ -141,22 +130,7 @@ function createStudentModel(archType) {
   return model;
 }
 
-// ==========================================
-// 4) Student custom loss (Level 2 + Level 3)
-// ==========================================
-
-function studentLoss(yTrue, yPred) {
-  return tf.tidy(() => {
-    const Ldist = cdfLoss(yTrue, yPred).mul(LOSS_COEFF.dist);
-    const Lsmooth = smoothness(yPred).mul(LOSS_COEFF.smooth);
-    const Ldir = directionX(yPred).mul(LOSS_COEFF.dir);
-    return Ldist.add(Lsmooth).add(Ldir);
-  });
-}
-
-// ==========================================
-// 5) Training (custom loop, no model.fit)
-// ==========================================
+// -------------------- Training loop --------------------
 
 function trainModelStep(model, optimizer, lossFn, x) {
   const varList = model.trainableWeights.map((w) => w.val);
@@ -177,15 +151,11 @@ function trainModelStep(model, optimizer, lossFn, x) {
 async function trainStep() {
   state.step += 1;
 
-  let baseLoss = 0;
-  let studLoss = 0;
-
   try {
-    baseLoss = tf.tidy(() =>
+    const baseLoss = tf.tidy(() =>
       trainModelStep(state.baselineModel, state.optimizerBase, mse, state.xInput),
     );
-
-    studLoss = tf.tidy(() =>
+    const studLoss = tf.tidy(() =>
       trainModelStep(
         state.studentModel,
         state.optimizerStudent,
@@ -194,23 +164,25 @@ async function trainStep() {
       ),
     );
 
-    log(
-      `Step ${state.step}: Base=${baseLoss.toFixed(4)} | Student=${studLoss.toFixed(4)} | λDist=${LOSS_COEFF.dist.toFixed(2)} λSmooth=${LOSS_COEFF.smooth.toFixed(2)} λDir=${LOSS_COEFF.dir.toFixed(2)}`,
-    );
-
     if (state.step % CONFIG.renderEvery === 0 || !state.isAutoTraining) {
       await render();
       updateLossDisplay(baseLoss, studLoss);
     }
+
+    log(
+      `Step ${state.step}: Base=${baseLoss.toFixed(4)} | Student=${studLoss.toFixed(
+        4,
+      )} | λDist=${LOSS_COEFF.dist.toFixed(2)} λSmooth=${LOSS_COEFF.smooth.toFixed(
+        2,
+      )} λDir=${LOSS_COEFF.dir.toFixed(2)}`,
+    );
   } catch (e) {
     log(`Training error: ${e.message}`, true);
     stopAutoTrain();
   }
 }
 
-// ==========================================
-// 6) Rendering + UI
-// ==========================================
+// -------------------- UI helpers --------------------
 
 async function render() {
   const basePred = state.baselineModel.predict(state.xInput);
@@ -230,12 +202,18 @@ async function render() {
 }
 
 function updateLossDisplay(base, stud) {
-  document.getElementById("loss-baseline").innerText = `Loss: ${base.toFixed(5)}`;
-  document.getElementById("loss-student").innerText = `Loss: ${stud.toFixed(5)}`;
+  const b = document.getElementById("loss-baseline");
+  const s = document.getElementById("loss-student");
+  if (b) b.innerText = `Loss: ${base.toFixed(5)}`;
+  if (s) s.innerText = `Loss: ${stud.toFixed(5)}`;
 }
 
 function log(msg, isError = false) {
   const el = document.getElementById("log-area");
+  if (!el) {
+    console[isError ? "error" : "log"](msg);
+    return;
+  }
   const div = document.createElement("div");
   div.innerText = `> ${msg}`;
   if (isError) div.classList.add("error");
@@ -249,18 +227,22 @@ function toggleAutoTrain() {
     return;
   }
   state.isAutoTraining = true;
-  btn.innerText = "Auto Train (Stop)";
-  btn.classList.add("btn-stop");
-  btn.classList.remove("btn-auto");
+  if (btn) {
+    btn.innerText = "Auto Train (Stop)";
+    btn.classList.add("btn-stop");
+    btn.classList.remove("btn-auto");
+  }
   loop();
 }
 
 function stopAutoTrain() {
   state.isAutoTraining = false;
   const btn = document.getElementById("btn-auto");
-  btn.innerText = "Auto Train (Start)";
-  btn.classList.add("btn-auto");
-  btn.classList.remove("btn-stop");
+  if (btn) {
+    btn.innerText = "Auto Train (Start)";
+    btn.classList.add("btn-auto");
+    btn.classList.remove("btn-stop");
+  }
 }
 
 function loop() {
@@ -293,19 +275,23 @@ function resetModels(archType = null) {
   render();
 }
 
+// Robust slider binding (fix for your issue)
 function bindSlider(id, valId, key) {
   const s = document.getElementById(id);
   const v = document.getElementById(valId);
+
+  if (!s || !v) {
+    log(`Slider bind failed: ${id} or ${valId} not found`, true);
+    return;
+  }
+
   const set = () => {
     LOSS_COEFF[key] = parseFloat(s.value);
-    v.innerText = LOSS_COEFF[key].toFixed(2);
+    v.textContent = LOSS_COEFF[key].toFixed(2);
   };
-  s.addEventListener("input", () => {
-    set();
-    log(
-      `Loss coeffs: dist=${LOSS_COEFF.dist.toFixed(2)}, smooth=${LOSS_COEFF.smooth.toFixed(2)}, dir=${LOSS_COEFF.dir.toFixed(2)}`,
-    );
-  });
+
+  s.addEventListener("input", set);
+  s.addEventListener("change", set);
   set();
 }
 
@@ -314,39 +300,45 @@ function init() {
   state.xInput = tf.randomUniform(CONFIG.inputShapeData, 0, 1, "float32");
 
   // draw input once
-  tf.browser.toPixels(
-    state.xInput.squeeze(),
-    document.getElementById("canvas-input"),
-  );
+  const cIn = document.getElementById("canvas-input");
+  if (cIn) tf.browser.toPixels(state.xInput.squeeze(), cIn);
 
   // init models
   resetModels("compression");
 
-  // bind UI buttons
-  document.getElementById("btn-train").addEventListener("click", trainStep);
-  document.getElementById("btn-auto").addEventListener("click", toggleAutoTrain);
-  document.getElementById("btn-reset").addEventListener("click", () => {
-    const checked = document.querySelector('input[name="arch"]:checked');
-    const arch = checked ? checked.value : "compression";
-    resetModels(arch);
-  });
+  // buttons
+  const btnTrain = document.getElementById("btn-train");
+  const btnAuto = document.getElementById("btn-auto");
+  const btnReset = document.getElementById("btn-reset");
 
-  // bind architecture radios
+  if (btnTrain) btnTrain.addEventListener("click", trainStep);
+  if (btnAuto) btnAuto.addEventListener("click", toggleAutoTrain);
+  if (btnReset)
+    btnReset.addEventListener("click", () => {
+      const checked = document.querySelector('input[name="arch"]:checked');
+      const arch = checked ? checked.value : "compression";
+      resetModels(arch);
+    });
+
+  // architecture radios
   document.querySelectorAll('input[name="arch"]').forEach((radio) => {
     radio.addEventListener("change", (e) => {
       const arch = e.target.value;
-      document.getElementById("student-arch-label").innerText =
-        arch.charAt(0).toUpperCase() + arch.slice(1);
+      const lbl = document.getElementById("student-arch-label");
+      if (lbl) lbl.innerText = arch.charAt(0).toUpperCase() + arch.slice(1);
       resetModels(arch);
     });
   });
 
-  // bind sliders
+  // sliders
   bindSlider("sld-dist", "val-dist", "dist");
   bindSlider("sld-smooth", "val-smooth", "smooth");
   bindSlider("sld-dir", "val-dir", "dir");
 
   log("Initialized. Ready to train.");
+  log(
+    `If sliders don't update: hard refresh (Ctrl+F5) and check that index.html contains the slider elements.`,
+  );
 }
 
 init();
